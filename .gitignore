@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# CUSTOMER DATA -- never commit.
+# Every parquet and CSV here is real DevRev CRM data: deal values, account IDs,
+# rep assignments, named champions. All of it is reproducible from
+#   python fetch_dim.py && python build_features.py && python make_dataset.py
+# so there is no reason to have it in git and every reason not to.
+# ---------------------------------------------------------------------------
+*.parquet
+*.csv
+
+# ---------------------------------------------------------------------------
+# CREDENTIALS. DEVREV_TOKEN is a bearer JWT and lives in the environment only.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+token*
+.netrc
+
+# ---------------------------------------------------------------------------
+# Notebook outputs. A saved output cell embeds the customer rows it printed --
+# deal IDs, ACVs, the at-risk table -- so a committed .ipynb leaks data even when
+# the .csv next to it is ignored. Both notebooks are clean right now (0 cells
+# with saved output). Keep them that way; strip before committing:
+#   jupyter nbconvert --clear-output --inplace *.ipynb
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+venv/
+*.egg-info/
+
+# Tooling / scratch
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+_nbtest.py
+scratch_*
+tmp_*
+
+# OS
+.DS_Store
