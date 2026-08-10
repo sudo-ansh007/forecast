@@ -27,12 +27,23 @@ LABEL = "is_won"
 # created_date is here so a downstream notebook can do the time split itself -- CSV row
 # order is dim_cache order, NOT chronological, and a positional split on it silently
 # becomes a quasi-random split (78 test wins instead of 49, PR-AUC 0.75 instead of 0.56).
-PASSTHROUGH = ["display_id", "acv", "created_date"]
+PASSTHROUGH = ["display_id", "acv", "created_date", "evidence"]
 
 # Green/Yellow/Red cut on CALIBRATED probability. Placeholder thresholds -- sales
 # owns these numbers, and they should be set from the reliability table, not taste.
 HEALTH_EDGES = [-0.01, 0.10, 0.30, 1.0]
 HEALTH_LABELS = ["Red", "Yellow", "Green"]
+
+# A deal at this evidence level has nothing recorded on it: no champion, no POC, fewer
+# than 2 contacts, never advanced a stage, no real amount. 1,150 of 1,912 open deals
+# (60%) sit here, and the matching closed cohort wins 1.2% of the time.
+#
+# These still get a probability -- deleting 60% of pipeline from the forecast is worse
+# than labelling it -- but the band is overridden, because the number is not a forecast.
+# The model reads absence of data on these rows, so a low score means "nobody has worked
+# this yet", not "this deal will lose". Sum them separately from the committed roll-up.
+MIN_EVIDENCE = 2
+INSUFFICIENT_LABEL = "Too early"
 
 SCHEMA = [
     ("days_in_current_stage", "number", "Days since the stage last changed"),
@@ -166,17 +177,41 @@ def main():
     ).fit(x_train, train[LABEL])
 
     out = score[PASSTHROUGH + ["stage_name"] + FEATURES].copy()
-    out["win_probability"] = model.predict_proba(x_score)[:, 1]
+    too_early = out["evidence"] < MIN_EVIDENCE
+
+    # win_probability is NULL where there is no evidence, not low. A number in that cell
+    # gets summed by whoever opens the CSV -- and summing all 1,912 gave $5.9M against a
+    # committed $4.2M, because 1,290 unworked deals at ~0.03 each add up. The band alone
+    # did not prevent that; an empty cell does. raw_probability keeps the model's actual
+    # output for anyone auditing, under a name nobody will total up by accident.
+    #
+    # Note this is NOT about stage. A 1-profile deal with a champion, POC and stakeholders
+    # recorded clears the gate and keeps its probability -- fields filled early are exactly
+    # the signal worth having. Only absence of evidence is censored.
+    out["raw_probability"] = model.predict_proba(x_score)[:, 1]
+    out["win_probability"] = out["raw_probability"].mask(too_early)
     out["health"] = pd.cut(out["win_probability"], HEALTH_EDGES, labels=HEALTH_LABELS)
+    out["health"] = out["health"].cat.add_categories([INSUFFICIENT_LABEL])
+    out.loc[too_early, "health"] = INSUFFICIENT_LABEL
     out["expected_revenue"] = out["win_probability"] * out["acv"]
-    out = out.sort_values("win_probability", ascending=False)
+    out = out.sort_values("win_probability", ascending=False, na_position="last")
     out.to_csv("ml_predictions.csv", index=False)
 
-    print(f"\nml_predictions.csv  {len(out):,} open deals scored")
-    print(f"  win_probability   min {out.win_probability.min():.3f}  "
-          f"median {out.win_probability.median():.3f}  max {out.win_probability.max():.3f}")
-    print(f"  expected wins     {out.win_probability.sum():.0f} of {len(out):,}")
-    print(f"  expected revenue  ${out.expected_revenue.sum() / 1e6:.1f}M")
+    # after the sort, so it stays aligned to out's index
+    too_early = out["evidence"] < MIN_EVIDENCE
+    scored, early = out[~too_early], out[too_early]
+    print(f"\nml_predictions.csv  {len(out):,} open deals")
+    print(f"  COMMITTED (evidence >= {MIN_EVIDENCE})  {len(scored):,} deals  "
+          f"{scored.win_probability.sum():.0f} expected wins  "
+          f"${scored.expected_revenue.sum() / 1e6:.1f}M")
+    print(f"    win_probability   min {scored.win_probability.min():.3f}  "
+          f"median {scored.win_probability.median():.3f}  "
+          f"max {scored.win_probability.max():.3f}")
+    print(f"  {INSUFFICIENT_LABEL.upper():<24} {len(early):,} deals  "
+          f"win_probability NULL, no revenue claimed")
+    print(f"    (raw_probability would have summed to {early.raw_probability.sum():.0f} "
+          f"wins / ${(early.raw_probability * early.acv).sum() / 1e6:.1f}M -- excluded "
+          "on purpose, nothing is recorded on these deals)")
 
     real_amount = (score["acv_missing"] == 0).mean() if "acv_missing" in score else np.nan
     print(f"  ^ amount is real on {real_amount:.0%} of these deals -- the rest is "
@@ -184,17 +219,21 @@ def main():
           "range with coverage stated")
 
     print("\nhealth bands:")
-    print(out["health"].value_counts().reindex(HEALTH_LABELS).to_string())
+    print(out["health"].value_counts().reindex(HEALTH_LABELS + [INSUFFICIENT_LABEL]).to_string())
     print("\ntop 5 by win probability:")
     print(out[["display_id", "stage_name", "win_probability", "acv", "health"]]
           .head(5).round(3).to_string(index=False))
 
-    # Self-check: calibrated probabilities must be usable as a revenue weight.
-    assert out.win_probability.between(0, 1).all(), "probability outside [0,1]"
+    # Self-check: calibrated probabilities must be usable as a revenue weight. Checks run
+    # on raw_probability where every row is populated, and on win_probability only where
+    # it is not deliberately NULL -- otherwise the null-out would silently pass them.
+    assert out.raw_probability.between(0, 1).all(), "probability outside [0,1]"
     assert out.health.notna().all(), "deal fell outside every health band"
+    assert out.win_probability.isna().equals(too_early), "NULLs do not match the gate"
+    assert out.loc[too_early, "expected_revenue"].isna().all(), "revenue claimed on a gated deal"
     base = train[LABEL].mean()
-    assert 0.2 * base < out.win_probability.mean() < 5 * base, (
-        f"mean prediction {out.win_probability.mean():.4f} implausible vs base rate {base:.4f}"
+    assert 0.2 * base < scored.win_probability.mean() < 5 * base, (
+        f"mean prediction {scored.win_probability.mean():.4f} implausible vs base rate {base:.4f}"
     )
     print("\nchecks passed")
 

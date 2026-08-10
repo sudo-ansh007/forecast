@@ -185,6 +185,35 @@ CONTRACT_MONTHS_MAX = 120
 TRAIN_COHORT = None   # ("2024-01-01", "2026-01-01") to re-enable, [start, end)
 TRAIN_TYPES = None    # ["new"] to re-enable
 
+# ON, and the reason is sales' rule rather than a metric: a deal that dies before stage 3
+# never got an amount because nobody worked it, so it was never a real opportunity. The
+# open pipeline confirms this with no outcome involved -- ACV is blank on 70.2% of stage
+# 1-2 open deals and 3.5% of stage 3+ (20x), so blank ACV marks EARLY, not LOST.
+#
+# That distinction is what makes this filter legitimate. Terminal stage_name on a closed
+# deal is always 8 or 9, so "reached stage 3" cannot be selected directly (that needs the
+# stage path, available for only 45% of losses -- see stage_path.py). Blank ACV is the
+# usable proxy.
+#
+#   filter                        train/wins   test/wins   base    lift   ROC     sum(p)/act
+#   none                          11,051/541   2,211/49    0.022   28.3x  0.9634  1.29x
+#   drop lost-blank (ON)           3,573/541     715/79    0.110    5.6x  0.8801  1.10x
+#   drop ALL blank (symmetric)     3,536/504     708/71    0.100    6.4x  0.8971  1.11x
+#
+# Buys sum(p)/actual 1.29x -> 1.10x: the roll-up over-predicts 10% instead of 29%. Costs
+# ROC 0.963 -> 0.880 and recall@20% 0.939 -> 0.759, a real loss of ranking power -- the
+# easy discriminations WERE the never-real deals, and separating 3-evaluate from
+# 6-negotiate is harder than separating either from 1-profile.
+#
+# PR-AUC and Brier are NOT comparable across these rows: base rate moves 2.2% -> 11%, and
+# PR-AUC's floor IS the base rate. Compare lift and ROC only.
+#
+# ASYMMETRIC ON PURPOSE, against the measurement. The symmetric version scores better on
+# every comparable metric, but it drops 37 blank-ACV WINS -- deals that closed won without
+# an amount. Those are real revenue, and deleting rows because of their label is the one
+# thing this filter must not do to stay honest. Chosen by decision, not by score.
+DROP_LOST_WITHOUT_AMOUNT = True
+
 
 def _json_get(raw, key):
     """dim_opportunity struct columns arrive as JSON strings (or dicts)."""
@@ -321,6 +350,22 @@ def clean(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
               "OUT_OF_SCOPE_CAVEAT")
         train = train[keep].copy()
 
+    if DROP_LOST_WITHOUT_AMOUNT:
+        # Raw acv, not acv_missing -- that column is computed in the imputation block
+        # below, so it does not exist yet.
+        drop = (train["is_won"] == 0) & train["acv"].isna()
+        print(f"drop lost-without-amount: dropped {drop.sum()} closed-lost deals with no "
+              f"ACV (never reached stage 3, so never real opportunities) -- "
+              f"{len(train)} -> {(~drop).sum()} rows, win rate "
+              f"{train['is_won'].mean():.1%} -> {train.loc[~drop, 'is_won'].mean():.1%}")
+        kept_blank_wins = ((train["is_won"] == 1) & train["acv"].isna()).sum()
+        print(f"  kept {kept_blank_wins} blank-ACV WINS -- asymmetric on purpose, see "
+              "DROP_LOST_WITHOUT_AMOUNT. Open pipeline is NOT filtered, so the "
+              f"{(score['acv'].isna()).sum()} blank-ACV open deals are scored by a model "
+              "trained without their closed-lost counterparts: predictions there read as "
+              "'if this were a real deal', not as P(win)")
+        train = train[~drop].copy()
+
     # amount is only ~31% populated. Dropping those rows biases hard toward wins, so
     # impute and flag instead -- the flag lets the model learn "no amount recorded".
     #
@@ -368,6 +413,17 @@ def clean(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             part[c] = part[c].astype(object).where(_filled(part[c]), "unknown")
             part[c] = part[c].astype(str).str.strip().str.lower()
 
+        # NOT a feature -- a reporting gate. Counts how many independent things a rep
+        # actually recorded. acv_missing is read (set above, before the fill on the next
+        # line), so this must stay after that block or the ACV term is always 1.
+        part["evidence"] = (
+            part["has_champion"].fillna(0).astype(int)
+            + part["poc"].fillna(0).astype(int)
+            + (part["num_stakeholders"].fillna(0) >= 2).astype(int)
+            + (part["stall_ratio"] < 1.0).astype(int)      # advanced at least one stage
+            + (part["acv_missing"] == 0).astype(int)
+        )
+
     return train, score
 
 
@@ -378,7 +434,7 @@ def main():
     df = parse_raw(raw)
     train, score = clean(df)
 
-    keep = LEAK_SAFE_FEATURES + POINT_IN_TIME_REQUIRED + ["id", "display_id", "stage_name",
+    keep = LEAK_SAFE_FEATURES + POINT_IN_TIME_REQUIRED + ["evidence", "id", "display_id", "stage_name",
                                                           "rep_id", "account_id", "created_date",
                                                           "target_close_date", "actual_close_date",
                                                           "acv", "state"]
