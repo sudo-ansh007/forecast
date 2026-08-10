@@ -158,6 +158,10 @@ STALL_RATIO_DEN = "days_in_sales_cycle"
 
 CATEGORICALS = ["opportunity_type", "source", "geo", "segment"]
 
+# Contract terms above this are entry errors, not deals. 99.9% of rows are <= 48
+# months; the only violator is a single 36000.
+CONTRACT_MONTHS_MAX = 120
+
 # TRAINING-SET FILTERS -- both measured, both OFF. Kept as flags because the arguments
 # for them are sound; they just do not survive contact with the data. Ablation over 5
 # seeds, time split, calibrated HGB on NO_AMOUNT_FEATURES:
@@ -248,7 +252,21 @@ def parse_raw(df: pd.DataFrame) -> pd.DataFrame:
 
     df["days_in_current_stage"] = cf_num("tnt__days_in_current_stage")
     df["days_in_sales_cycle"] = cf_num("tnt__days_in_sales_cycle")
+    # One deal carries contract_months = 36000 -- 3000 years, and a units error at
+    # entry (36000 months where 36 was meant, or days-as-months). It is a single
+    # closed-lost row, but it sets max/p99 = 1000x and skew = 105, which distorts
+    # any scaling or binning of this column. NaN it out and let the median
+    # imputation in clean() handle it like any other blank. Anything over 120
+    # months (10 years) gets the same treatment -- no real SaaS term is longer,
+    # and 99.9% of deals are at 48 months or under.
     df["contract_months"] = cf_num("tnt__contract_months")
+    implausible = df["contract_months"] > CONTRACT_MONTHS_MAX
+    if implausible.any():
+        print(f"contract_months: {implausible.sum()} row(s) over {CONTRACT_MONTHS_MAX} "
+              f"months set to NaN (values: "
+              f"{sorted(df.loc[implausible, 'contract_months'].unique())}) -- units error "
+              "at entry, imputed downstream")
+        df.loc[implausible, "contract_months"] = np.nan
     df["segment"] = cf_raw("tnt__segment")
     df["geo"] = cf_raw("tnt__geo")
     df["source"] = cf_raw("tnt__source")

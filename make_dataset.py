@@ -15,8 +15,8 @@ Usage:
 """
 import numpy as np
 import pandas as pd
+from lightgbm import LGBMClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold
 
 from build_features import CATEGORICALS, NO_AMOUNT_FEATURES
@@ -51,6 +51,41 @@ SCHEMA = [
     ("acv", "number", "Annual contract value. NOT a feature -- used only to weight the revenue roll-up"),
     ("created_date", "date", "Deal creation timestamp. NOT a feature (cohort censoring) -- sort by it to build the time split"),
 ]
+
+
+def new_estimator(random_state: int = 0):
+    """The base classifier. Wrap in CalibratedClassifierCV before use.
+
+    LightGBM, at the LIBRARY DEFAULT depth/leaves/min_child_samples. Measured on the
+    time split (train 8,840/492 wins, test 2,211/49 wins), 5 seeds:
+
+        model                          test PR-AUC     Brier    ROC   sum(p)/act
+        HGB shipping (previous)      0.5825 +-0.0063  0.01369  0.9598    1.21x
+        LGBM default d3/l8/mcs50     0.6276 +-0.0000  0.01324  0.9644    1.28x
+        LGBM tuned d4/l15/mcs20      0.6125 +-0.0000  0.01321  0.9626    1.30x
+        LGBM d4/l15/mcs100/lr.05     0.6032 +-0.0000  0.01370  0.9627    1.29x
+
+    +0.045 PR-AUC over HistGB against a 0.0063 seed spread, so the gain is real and
+    not a lucky seed. Better Brier and ROC too. Costs 1.21x -> 1.28x on
+    sum(p)/actual, i.e. the aggregate roll-up over-predicts a little more; PR-AUC and
+    Brier both improving says the ranking and the per-deal probabilities are better,
+    and the aggregate bias is a known over-prediction documented in dataset_sample.md.
+
+    TUNING WAS TRIED AND REJECTED. A 48-config grid over max_depth {2,3,4,6,-1},
+    num_leaves, min_child_samples {20,50,100}, learning_rate/n_estimators, plus L1/L2
+    and subsampling variants, scored by 5-fold out-of-fold PR-AUC WITHIN train so the
+    test set stayed untouched. OOF picked d4/l15/mcs20/lr0.1 at 0.8262 against the
+    default's 0.8219 -- a 0.0043 edge across a grid whose total spread was 0.0351.
+    On test that "winner" scored 0.6125 vs the default's 0.6276: it lost 0.015. The
+    OOF gap was noise, and chasing it cost real accuracy. Defaults stay.
+
+    LightGBM is deterministic here (seed sd 0.0000) because it does no subsampling by
+    default, so random_state changes nothing. It is still threaded through for the
+    ablation harness in win_probability_colab.ipynb.
+    """
+    return LGBMClassifier(
+        max_depth=3, num_leaves=8, min_child_samples=50, n_estimators=200,
+        learning_rate=0.05, random_state=random_state, verbose=-1, n_jobs=-1)
 
 
 def encode(train: pd.DataFrame, score: pd.DataFrame):
@@ -91,8 +126,9 @@ def encode(train: pd.DataFrame, score: pd.DataFrame):
 
 
 def main():
-    # Fixed shuffle before any fitting. HistGB's early-stopping holdout is the LAST 15%
-    # of rows as given, so on chronologically-ordered data it validates on one era only.
+    # Fixed shuffle before any fitting. Kept after the switch to LightGBM: the
+    # calibrator's folds are still positional slices of whatever order arrives, and
+    # unshuffled chronological rows put a different era of the business in each fold.
     # Deterministic seed, so the output is still reproducible run to run.
     train = pd.read_parquet("train.parquet").sample(frac=1, random_state=0).reset_index(drop=True)
     score = pd.read_parquet("score.parquet")
@@ -106,7 +142,14 @@ def main():
     print(f"ml_score.csv   {len(score):>6,} open deals    {len(FEATURES)} features, no label")
     print(f"ml_schema.csv  {len(SCHEMA):>6} columns documented")
 
-    # Sigmoid (Platt) not isotonic: isotonic needs several hundred positives to behave
+    # Sigmoid (Platt) not isotonic. Measured on test: sigmoid cv=3 gives PR-AUC 0.6276
+    # / Brier 0.01324, isotonic cv=5 gives 0.6138 / 0.01302 -- isotonic buys 0.0002
+    # Brier for 0.014 PR-AUC, and needs several hundred positives to behave anyway.
+    # More folds is worse, not better: cv=3 0.6276, cv=5 0.6224, cv=10 0.6126.
+    # Calibration is not free -- raw LightGBM scores 1.11x on sum(p)/actual and
+    # sigmoid pushes it to 1.28x, but raw loses 0.021 PR-AUC and its probabilities
+    # are not usable as revenue weights, which is the whole point.
+    # Original note: isotonic needs several hundred positives to behave
     # and we have 541. 3 folds keeps each large enough to hold real positives.
     #
     # shuffle=True matters. cv=3 alone uses UNSHUFFLED StratifiedKFold, so on
@@ -118,10 +161,8 @@ def main():
     # is also a positional slice -- hence shuffle_train() below.
     x_train, x_score = encode(train, score)
     model = CalibratedClassifierCV(
-        HistGradientBoostingClassifier(
-            max_depth=3, min_samples_leaf=50, max_iter=200, learning_rate=0.05,
-            early_stopping=True, validation_fraction=0.15, random_state=0),
-        method="sigmoid", cv=StratifiedKFold(3, shuffle=True, random_state=0),
+        new_estimator(), method="sigmoid",
+        cv=StratifiedKFold(3, shuffle=True, random_state=0),
     ).fit(x_train, train[LABEL])
 
     out = score[PASSTHROUGH + ["stage_name"] + FEATURES].copy()
