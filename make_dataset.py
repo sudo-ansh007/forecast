@@ -15,9 +15,9 @@ Usage:
 """
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import StratifiedKFold
+from xgboost import XGBClassifier
 
 from build_features import CATEGORICALS, NO_AMOUNT_FEATURES
 
@@ -67,36 +67,42 @@ SCHEMA = [
 def new_estimator(random_state: int = 0):
     """The base classifier. Wrap in CalibratedClassifierCV before use.
 
-    LightGBM, at the LIBRARY DEFAULT depth/leaves/min_child_samples. Measured on the
-    time split (train 8,840/492 wins, test 2,211/49 wins), 5 seeds:
+    XGBoost at depth 3, min_child_weight 1. Measured by pick_shipping.py on the time
+    split (train 2,858/462 wins, test 715/79 wins, base rate 11.0%), 5 seeds, each
+    candidate run through the FULL shipping path -- same encode, same calibrator, same
+    evidence gate -- because the deliverable is a calibrated probability that gets
+    multiplied by ACV, not a test-set PR-AUC:
 
-        model                          test PR-AUC     Brier    ROC   sum(p)/act
-        HGB shipping (previous)      0.5825 +-0.0063  0.01369  0.9598    1.21x
-        LGBM default d3/l8/mcs50     0.6276 +-0.0000  0.01324  0.9644    1.28x
-        LGBM tuned d4/l15/mcs20      0.6125 +-0.0000  0.01321  0.9626    1.30x
-        LGBM d4/l15/mcs100/lr.05     0.6032 +-0.0000  0.01370  0.9627    1.29x
+        model                    PR-AUC     sd    ROC   Brier   ECE    rec@20  sum(p)/act
+        XGBoost min_child_wt1    0.6304 0.0000  0.8790  0.0668  0.0228  0.785    1.10x
+        LightGBM (previous)      0.6206 0.0000  0.8763  0.0682  0.0272  0.747    1.11x
+        CatBoost d3 it600 lr.03  0.6201 0.0025  0.8770  0.0677  0.0260  0.762    1.14x
+        CatBoost d3              0.6164 0.0040  0.8766  0.0688  0.0279  0.722    1.15x
+        CatBoost raw (uncal)     0.6159 0.0033  0.8764  0.0667  0.0260  0.724    1.15x
 
-    +0.045 PR-AUC over HistGB against a 0.0063 seed spread, so the gain is real and
-    not a lucky seed. Better Brier and ROC too. Costs 1.21x -> 1.28x on
-    sum(p)/actual, i.e. the aggregate roll-up over-predicts a little more; PR-AUC and
-    Brier both improving says the ranking and the per-deal probabilities are better,
-    and the aggregate bias is a known over-prediction documented in dataset_sample.md.
+    XGBoost wins on ALL SEVEN columns -- ranking, discrimination, per-deal probability,
+    calibration error, top-quintile recall and aggregate ratio. No trade-off to weigh,
+    which is why the switch is unambiguous. Both it and LightGBM have seed sd 0.0000
+    (neither subsamples by default), so the +0.0099 gap is not seed luck.
 
-    TUNING WAS TRIED AND REJECTED. A 48-config grid over max_depth {2,3,4,6,-1},
-    num_leaves, min_child_samples {20,50,100}, learning_rate/n_estimators, plus L1/L2
-    and subsampling variants, scored by 5-fold out-of-fold PR-AUC WITHIN train so the
-    test set stayed untouched. OOF picked d4/l15/mcs20/lr0.1 at 0.8262 against the
-    default's 0.8219 -- a 0.0043 edge across a grid whose total spread was 0.0351.
-    On test that "winner" scored 0.6125 vs the default's 0.6276: it lost 0.015. The
-    OOF gap was noise, and chasing it cost real accuracy. Defaults stay.
+    The forecast barely moves: 56.9 expected wins / $4.04M vs LightGBM's 56.2 / $3.97M
+    across the 622 gated open deals. A $0.06M difference, i.e. this is free accuracy,
+    not a revenue restatement.
 
-    LightGBM is deterministic here (seed sd 0.0000) because it does no subsampling by
-    default, so random_state changes nothing. It is still threaded through for the
-    ablation harness in win_probability_colab.ipynb.
+    CALIBRATION IS NOT OPTIONAL, and CatBoost raw shows why. Its ranking is mid-pack
+    (0.6159) yet it ships 62.9 wins / $4.61M -- $0.6M above the calibrated models --
+    and its max probability is 0.880 against XGBoost's 0.954. Uncalibrated output
+    cannot be used as a revenue weight however good its ordering looks.
+
+    TUNING WAS TRIED AND REJECTED on the previous dataset: a 48-config grid scored by
+    5-fold out-of-fold PR-AUC within train picked a config that then LOST 0.015 on
+    test. Not re-run after the DROP_LOST_WITHOUT_AMOUNT filter changed the base rate
+    from 2.2% to 11.0%; the grid's conclusion may no longer hold, and 79 test
+    positives is too few to chase 0.01 differences anyway.
     """
-    return LGBMClassifier(
-        max_depth=3, num_leaves=8, min_child_samples=50, n_estimators=200,
-        learning_rate=0.05, random_state=random_state, verbose=-1, n_jobs=-1)
+    return XGBClassifier(
+        max_depth=3, n_estimators=200, learning_rate=0.05, min_child_weight=1,
+        random_state=random_state, n_jobs=-1, eval_metric="logloss")
 
 
 def encode(train: pd.DataFrame, score: pd.DataFrame):
@@ -137,10 +143,10 @@ def encode(train: pd.DataFrame, score: pd.DataFrame):
 
 
 def main():
-    # Fixed shuffle before any fitting. Kept after the switch to LightGBM: the
-    # calibrator's folds are still positional slices of whatever order arrives, and
-    # unshuffled chronological rows put a different era of the business in each fold.
-    # Deterministic seed, so the output is still reproducible run to run.
+    # Fixed shuffle before any fitting. Kept across the HistGB -> LightGBM -> XGBoost
+    # switches: the calibrator's folds are still positional slices of whatever order
+    # arrives, and unshuffled chronological rows put a different era of the business in
+    # each fold. Deterministic seed, so the output is still reproducible run to run.
     train = pd.read_parquet("train.parquet").sample(frac=1, random_state=0).reset_index(drop=True)
     score = pd.read_parquet("score.parquet")
 
@@ -153,23 +159,25 @@ def main():
     print(f"ml_score.csv   {len(score):>6,} open deals    {len(FEATURES)} features, no label")
     print(f"ml_schema.csv  {len(SCHEMA):>6} columns documented")
 
-    # Sigmoid (Platt) not isotonic. Measured on test: sigmoid cv=3 gives PR-AUC 0.6276
-    # / Brier 0.01324, isotonic cv=5 gives 0.6138 / 0.01302 -- isotonic buys 0.0002
-    # Brier for 0.014 PR-AUC, and needs several hundred positives to behave anyway.
-    # More folds is worse, not better: cv=3 0.6276, cv=5 0.6224, cv=10 0.6126.
-    # Calibration is not free -- raw LightGBM scores 1.11x on sum(p)/actual and
-    # sigmoid pushes it to 1.28x, but raw loses 0.021 PR-AUC and its probabilities
-    # are not usable as revenue weights, which is the whole point.
-    # Original note: isotonic needs several hundred positives to behave
-    # and we have 541. 3 folds keeps each large enough to hold real positives.
+    # Sigmoid (Platt), 3 folds, shuffled. Isotonic needs several hundred positives to
+    # behave and we have 541; 3 folds keeps each large enough to hold real ones.
+    #
+    # Calibration is not free accuracy, it is a units fix. pick_shipping.py measured
+    # CatBoost raw uncalibrated at 1.15x on sum(p)/actual against 1.10x calibrated --
+    # $0.6M of phantom pipeline -- with max probability 0.880 vs 0.954. Ranking can look
+    # fine while the probabilities are unusable as revenue weights, which is the point.
+    #
+    # STALE, from the 11,051-row dataset at a 2.2% base rate, kept because the ORDERING
+    # is what mattered and it was consistent: sigmoid cv=3 0.6276 > cv=5 0.6224 > cv=10
+    # 0.6126, and isotonic cv=5 bought 0.0002 Brier for 0.014 PR-AUC. Not re-measured
+    # since DROP_LOST_WITHOUT_AMOUNT moved the base rate to 11.0%.
     #
     # shuffle=True matters. cv=3 alone uses UNSHUFFLED StratifiedKFold, so on
     # chronologically-sorted rows each calibration fold is a different era of the
     # business and the fitted sigmoid depends on row order: expected wins swung 71.8
     # (file order) / 79.2 (by created_date) / 72.9 (reversed) -- a 10% move in the
     # headline revenue number from nothing but sort order. Shuffling cuts that spread
-    # from 7.4 wins to 3.7. The residual is HistGB's own early-stopping holdout, which
-    # is also a positional slice -- hence shuffle_train() below.
+    # from 7.4 wins to 3.7.
     x_train, x_score = encode(train, score)
     model = CalibratedClassifierCV(
         new_estimator(), method="sigmoid",
