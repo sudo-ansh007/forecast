@@ -150,8 +150,12 @@ def main():
     train = pd.read_parquet("train.parquet").sample(frac=1, random_state=0).reset_index(drop=True)
     score = pd.read_parquet("score.parquet")
 
+    # stage_name goes to the OPEN file only, deliberately. On a closed deal the terminal
+    # stage is always 8-won or 9-lost, i.e. it IS the label -- shipping it in ml_train.csv
+    # hands a leak to anyone who adds it to FEATURES. On open deals it is just context for
+    # a human reading the forecast.
     train[PASSTHROUGH + FEATURES + [LABEL]].to_csv("ml_train.csv", index=False)
-    score[PASSTHROUGH + FEATURES].to_csv("ml_score.csv", index=False)
+    score[PASSTHROUGH + ["stage_name"] + FEATURES].to_csv("ml_score.csv", index=False)
     pd.DataFrame(SCHEMA, columns=["column", "type", "meaning"]).to_csv("ml_schema.csv", index=False)
 
     print(f"ml_train.csv   {len(train):>6,} closed deals  {train[LABEL].sum()} won "
