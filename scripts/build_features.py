@@ -1,8 +1,8 @@
 """Feature builder for deal win-probability model.
 
 Reads the raw dim_opportunity pull (dim_cache.parquet) and produces:
-    train.parquet  -- closed deals, has is_won label
-    score.parquet  -- open + in_progress deals, inference targets
+    dataset/train.parquet  -- closed deals, has is_won label
+    dataset/score.parquet  -- open + in_progress deals, inference targets
 
 dim_opportunity is the CURRENT-STATE table: one row per deal, already deduped.
 fact_opportunity is the change-log, but its coverage only starts 2026-05-01 while
@@ -13,11 +13,26 @@ Usage:
     python build_features.py
 """
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+DATASET_DIR = Path("dataset")
+DATASET_DIR.mkdir(exist_ok=True)
+
 DIM_CACHE = "dim_cache.parquet"
+DIM_LINK_CACHE = "devrev_dim_link_0.parquet"
+# Carries scheduled_date -- when a meeting was actually held. dim_link only
+# knows when the link row was ingested. See _meeting_features.
+DIM_MEETING_CACHE = "devrev_dim_meeting_0.parquet"
+
+# Output paths and the lost-without-amount filter are env-overridable so an
+# ablation run can be compared side by side without overwriting the live
+# artifacts the notebook reads. Defaults reproduce the shipping build exactly.
+TRAIN_OUT = os.environ.get("TRAIN_OUT", str(DATASET_DIR / "train.parquet"))
+SCORE_OUT = os.environ.get("SCORE_OUT", str(DATASET_DIR / "score.parquet"))
 
 WON_STAGES = {"8-closed_won", "Closed Won"}
 
@@ -40,7 +55,17 @@ LEAK_SAFE_FEATURES = [
     "log_acv", "acv_missing", "days_in_current_stage", "days_in_sales_cycle",
     "stall_ratio", "contract_months", "num_stakeholders", "has_champion", "poc",
     "opportunity_type", "source", "geo", "segment",
+    "number_of_meetings", "days_since_latest_meeting",
+    "meetings_first_30d", "meetings_per_month", "meeting_quiet_frac",
 ]
+
+# Meeting VELOCITY columns, added because engagement trajectory should survive
+# forward better than an all-time count: meetings_per_month and
+# meeting_quiet_frac are scale-free, so they do not grow with deal age the way
+# number_of_meetings does. meetings_first_30d is a fixed early window, so it is
+# the only one of the three fully determined before the deal could progress.
+# All three are anchored to the deal's own prediction point -- see _meeting_features.
+MEETING_VELOCITY = ["meetings_first_30d", "meetings_per_month", "meeting_quiet_frac"]
 
 # nda is DROPPED -- it made the model WORSE. 9.1x raw lift (40.6% win rate on the 138
 # closed deals that have it vs 4.4% without) but only 56 wins behind it, so a shallow
@@ -212,7 +237,22 @@ TRAIN_TYPES = None    # ["new"] to re-enable
 # every comparable metric, but it drops 37 blank-ACV WINS -- deals that closed won without
 # an amount. Those are real revenue, and deleting rows because of their label is the one
 # thing this filter must not do to stay honest. Chosen by decision, not by score.
-DROP_LOST_WITHOUT_AMOUNT = True
+#
+# Env-overridable (DROP_LOST_WITHOUT_AMOUNT=0) so the un-dropped population can be
+# measured rather than argued about. Note the evidence gate already removes most of
+# what this filter removes: of the 1,132 open deals with no ACV, only 135 (11.9%)
+# clear evidence>=2, because (acv_missing == 0) is itself one of the five evidence
+# points. So the two are a matched pair, and flipping this alone is not the fix it
+# looks like -- the aligned-population experiment is TRAIN_EVIDENCE_MIN below.
+DROP_LOST_WITHOUT_AMOUNT = os.environ.get("DROP_LOST_WITHOUT_AMOUNT", "1") != "0"
+
+# Train only on rows that would clear the reporting gate, i.e. train on the same
+# population that actually gets scored. This is the principled version of the
+# filter above: it uses the gate already trusted downstream instead of ACV
+# presence as a proxy for it. None = off (ship default).
+TRAIN_EVIDENCE_MIN = (
+    int(os.environ["TRAIN_EVIDENCE_MIN"]) if os.environ.get("TRAIN_EVIDENCE_MIN") else None
+)
 
 
 def _json_get(raw, key):
@@ -241,7 +281,7 @@ def parse_raw(df: pd.DataFrame) -> pd.DataFrame:
     # bug. Convert once here so nothing downstream has to remember.
     for c in ["created_date", "target_close_date", "actual_close_date", "modified_date"]:
         if c in df and not pd.api.types.is_datetime64_any_dtype(df[c]):
-            df[c] = pd.to_datetime(pd.to_numeric(df[c], errors="coerce"), unit="ms")
+            df[c] = pd.to_datetime(pd.to_numeric(df[c], errors="coerce"), unit="ms", errors="coerce")
 
     df["stage_name"] = df["stage_json"].apply(lambda v: _json_get(v, "name"))
 
@@ -403,6 +443,13 @@ def clean(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             part[c] = part[c].fillna(train[c].median())
         part["contract_months"] = part["contract_months"].fillna(contract_med)
 
+        # ponytail: large sentinel (999) for "no meetings ever" -- tree can split on it naturally
+        part["days_since_latest_meeting"] = part["days_since_latest_meeting"].fillna(999)
+        # no meetings ever -> zero cadence, and quiet for the whole deal life
+        part["meetings_first_30d"] = part["meetings_first_30d"].fillna(0)
+        part["meetings_per_month"] = part["meetings_per_month"].fillna(0.0)
+        part["meeting_quiet_frac"] = part["meeting_quiet_frac"].fillna(1.0)
+
         # after imputation so it is never NaN; clip(1) guards day-zero deals
         part["stall_ratio"] = (
             part[STALL_RATIO_NUM] / part[STALL_RATIO_DEN].clip(lower=1)
@@ -424,7 +471,110 @@ def clean(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             + (part["acv_missing"] == 0).astype(int)
         )
 
+    if TRAIN_EVIDENCE_MIN is not None:
+        # TRAIN only. The score side keeps every row so the gate stays a reporting
+        # decision downstream, not a silent narrowing of the pipeline here.
+        keep = train["evidence"] >= TRAIN_EVIDENCE_MIN
+        print(f"train evidence>={TRAIN_EVIDENCE_MIN}: dropped {(~keep).sum()} closed deals "
+              f"({train.loc[~keep, 'is_won'].sum()} wins), {len(train)} -> {keep.sum()} rows, "
+              f"win rate {train['is_won'].mean():.1%} -> {train.loc[keep, 'is_won'].mean():.1%}. "
+              "Trains on the same population the reporting gate scores.")
+        train = train[keep].copy()
+
     return train, score
+
+
+def _meeting_features(opps: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns DataFrame indexed by opportunity id with:
+      number_of_meetings        -- count of meeting links up to the anchor
+      days_since_latest_meeting -- anchor minus most recent meeting date
+      meetings_first_30d        -- meetings in the deal's first 30 days
+      meetings_per_month        -- cadence over the deal's life so far
+      meeting_quiet_frac        -- share of deal life since the last meeting
+    Missing links → 0 meetings, NaN days (imputed downstream).
+
+    ANCHOR: every elapsed-time figure is measured to the deal's OWN prediction
+    point -- actual_close_date for closed deals, today for open ones -- never to
+    wall-clock now(). Anchoring closed deals to now() made
+    days_since_latest_meeting mean "days of post-close silence" in training
+    (~600d on a 2024 deal) while meaning "days gone quiet" at serve (~30d on a
+    live deal): one column carrying two different quantities. That is the same
+    train/serve skew already documented above for days_in_sales_cycle.
+
+    Meetings dated after the anchor are dropped, so no post-prediction-point
+    activity reaches a feature. The velocity columns are scale-free by
+    construction (per-month, or a fraction of deal life), so unlike a raw
+    all-time count they do not drift with deal age -- see the created_date note.
+
+    MEETING DATE = dim_meeting.scheduled_date, when the meeting was actually
+    held -- NOT dim_link.created_date, which is when the meeting->opportunity
+    link row was ingested. Those are wildly different: link rows only exist from
+    2025-02-04 onward and cluster in import batches (2026-03-20 alone holds 19.6%
+    of all links), while scheduled_date reaches back to 2023-02-20. Ingest lag
+    ran a mean of 86 days and p95 of 501; 33% of links landed >30d after the
+    meeting happened. Built on link dates, all 787 deals that closed before
+    2025-02-04 showed exactly 0 meetings and the 999 sentinel -- so "no meetings"
+    encoded "the link table did not exist yet", and since that era won at 0.263
+    vs 0.120 after, the sentinel became an era marker the model read as signal.
+    """
+    links = pd.read_parquet(DIM_LINK_CACHE, columns=["source_id", "target_id", "source_object_type", "target_object_type"])
+    meet = links[
+        (links["target_object_type"] == "opportunity") &
+        (links["source_object_type"] == "meeting")
+    ].copy()
+
+    held = pd.read_parquet(DIM_MEETING_CACHE, columns=["id", "scheduled_date"])
+    sd = held["scheduled_date"]
+    if getattr(sd.dtype, "tz", None) is not None:
+        held["scheduled_date"] = sd.dt.tz_localize(None)
+    meet = meet.merge(
+        held.rename(columns={"id": "source_id", "scheduled_date": "meeting_date"}),
+        on="source_id", how="left",
+    )
+    unmatched = meet["meeting_date"].isna()
+    if unmatched.any():
+        # No held date -> the meeting cannot be placed in time, so it is dropped
+        # rather than back-filled with an ingest stamp.
+        print(f"meeting features: dropped {unmatched.sum()} of {len(meet)} links with no "
+              "scheduled_date in dim_meeting")
+    meet = meet[~unmatched]
+
+    today = pd.Timestamp.now(tz=None).normalize()
+    anchor = opps["actual_close_date"].where(opps["state"] == "closed", today).fillna(today)
+    ref = pd.DataFrame({
+        "target_id": opps["id"].to_numpy(),
+        "created": opps["created_date"].to_numpy(),
+        "anchor": anchor.to_numpy(),
+    })
+
+    j = meet.merge(ref, on="target_id", how="inner")
+    after = j["meeting_date"] > j["anchor"]
+    if after.any():
+        print(f"meeting features: dropped {after.sum()} meeting links dated after their "
+              "deal's prediction point (close date for closed deals, today for open)")
+    j = j[~after]
+
+    j["life_days"] = (j["anchor"] - j["created"]).dt.days.clip(lower=1)
+    j["in_first_30d"] = ((j["meeting_date"] - j["created"]).dt.days <= 30).astype(int)
+
+    agg = j.groupby("target_id").agg(
+        number_of_meetings=("source_id", "count"),
+        latest_meeting_date=("meeting_date", "max"),
+        meetings_first_30d=("in_first_30d", "sum"),
+        life_days=("life_days", "first"),
+        anchor=("anchor", "first"),
+    )
+    agg["days_since_latest_meeting"] = (agg["anchor"] - agg["latest_meeting_date"]).dt.days
+    agg["meetings_per_month"] = agg["number_of_meetings"] / (agg["life_days"] / 30.44)
+    agg["meeting_quiet_frac"] = (agg["days_since_latest_meeting"] / agg["life_days"]).clip(0, 1)
+    agg = agg.drop(columns=["latest_meeting_date", "life_days", "anchor"])
+
+    # reindex to all opportunities; fill missing with 0 meetings, NaN days
+    agg = agg.reindex(opps["id"])
+    agg["number_of_meetings"] = agg["number_of_meetings"].fillna(0).astype(int)
+    print(f"meeting features: {(agg['number_of_meetings'] > 0).sum()} of {len(agg)} opportunities have ≥1 meeting")
+    return agg
 
 
 def main():
@@ -432,14 +582,20 @@ def main():
     print(f"loaded {len(raw)} deals from {DIM_CACHE}")
 
     df = parse_raw(raw)
+
+    meet_feats = _meeting_features(df[["id", "created_date", "actual_close_date", "state"]])
+    df = df.join(meet_feats, on="id")
+
     train, score = clean(df)
 
     keep = LEAK_SAFE_FEATURES + POINT_IN_TIME_REQUIRED + ["evidence", "id", "display_id", "stage_name",
                                                           "rep_id", "account_id", "created_date",
                                                           "target_close_date", "actual_close_date",
                                                           "acv", "state"]
-    train[keep + ["is_won"]].to_parquet("train.parquet", index=False)
-    score[keep].to_parquet("score.parquet", index=False)
+    train[keep + ["is_won"]].to_parquet(TRAIN_OUT, index=False)
+    score[keep].to_parquet(SCORE_OUT, index=False)
+    if (TRAIN_OUT, SCORE_OUT) != ("train.parquet", "score.parquet"):
+        print(f"wrote {TRAIN_OUT} / {SCORE_OUT} (overridden via TRAIN_OUT/SCORE_OUT)")
 
     print(f"train: {len(train)} closed  ({train.is_won.sum()} won, "
           f"win rate {train.is_won.mean():.3f})")

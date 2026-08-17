@@ -43,6 +43,30 @@ venv/
 _nbtest.py
 scratch_*
 tmp_*
+_add_*.py
+_pr_*.py
+_thr_*.py
+_backup_*.py
+
+# Dead code (to be deleted)
+make_dataset.py
+ml_train.csv
+add_optuna_tuning.py
+add_final_cells.py
+add_catboost_tuning.py
+debug_query.py
+fetch_oasis.py
+
+# Model artifacts and results (generated, not source)
+models/
+results/
+dataset/
+
+# Development backups
+_backup_*.parquet
+_backup_*.ipynb
+_ingest_dates_*.parquet
+catboost_info/
 
 # OS
 .DS_Store
