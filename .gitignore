@@ -5,7 +5,8 @@
 #   python fetch_dim.py && python build_features.py && python make_dataset.py
 # so there is no reason to have it in git and every reason not to.
 # ---------------------------------------------------------------------------
-*.parquet
+
+
 *.csv
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,6 @@ fetch_oasis.py
 # Model artifacts and results (generated, not source)
 models/
 results/
-dataset/
 
 # Development backups
 _backup_*.parquet
