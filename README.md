@@ -38,7 +38,7 @@ Includes 5-fold walk-forward evaluation. Reports: PR-AUC, ROC, calibration ratio
 ```bash
 # Refit the calibrator on recent closed deals
 # Do NOT retrain the full model (ranking does not decay)
-python train_model.py --calibrate-only
+python scripts/train_model.py --calibrate-only
 ```
 
 Monitors `calibration_ratio` (target <1.30). If >1.60, refits the sigmoid layer to correct drift.
@@ -245,15 +245,145 @@ python trend_baseline.py
 # If ratio >5x or <0.5x: investigate (cohort shift or model drift)
 ```
 
-### Full Retrain (Only When Features Change)
+### Full Retrain (Yearly or When Features Change)
 
 ```bash
-# Features, hyperparams, or training data changed
-python train_model.py
+# Full retraining from scratch
+python scripts/train_model.py
 
 # Full walk-forward eval (5 folds, 5 seeds)
 # Saves new models/catboost_model.pkl + sigmoid_calibrator.pkl
+# Expensive: ~30 min compute, learns old + new patterns
 ```
+
+---
+
+## Training & Calibration Strategy
+
+### Two-Layer Architecture
+
+The model has two independent components:
+
+| Component | What It Does | How Often | Cost | Why |
+|---|---|---|---|---|
+| **CatBoost Model** | Learns deal patterns (features → win probability) | Yearly | High (~30 min) | Doesn't decay; no need to retrain frequently. Expensive. |
+| **Sigmoid Calibrator** | Adjusts raw probabilities to match real close rates | Monthly | Low (~1 min) | Drifts as market/pipeline changes. Cheap to update. |
+
+### How It Works
+
+**Full Pipeline:**
+```
+Raw deal → CatBoost model → raw probability (0.0–1.0)
+                                     ↓
+                           Sigmoid calibrator
+                                     ↓
+                          Final probability (adjusted)
+```
+
+**Example:**
+- CatBoost outputs: 0.65 (deal looks 65% likely to close)
+- Recent deals closed slower (actual close rate 55% when predicted 65%)
+- Calibrator learns: multiply by 0.85
+- Final: 0.65 × 0.85 = 0.55 (adjusted down)
+
+### When to Use Each
+
+**`--calibrate-only` (Cheap Monthly Update)**
+
+```bash
+python scripts/train_model.py --calibrate-only
+```
+
+- **What it does:** Refits ONLY the sigmoid calibrator
+- **Input:** Recent closed deals (last 15% of timeline)
+- **Output:** New `sigmoid_calibrator.pkl`
+- **Keeps:** Old `catboost_model.pkl` unchanged
+- **Runtime:** <1 minute
+- **Cost:** Negligible
+- **When:** Every month (or whenever `calibration_ratio` >1.60)
+
+Example output:
+```
+recalibrated on 536 recent deals (123 wins)
+  ratio before: 1.42x (WARN refit calibrator)
+  ratio after:  1.18x (OK)
+```
+
+**Full Retrain (Expensive Yearly)**
+
+```bash
+python scripts/train_model.py
+```
+
+- **What it does:** Retrains CatBoost model + refits calibrator
+- **Input:** ALL closed deals (add new, keep old)
+- **Output:** New `catboost_model.pkl` + `sigmoid_calibrator.pkl`
+- **Preserves:** Old patterns (model trained on them again)
+- **Learns:** New patterns (recent closed deals)
+- **Runtime:** ~30 minutes
+- **Cost:** Significant on cloud
+- **When:** Yearly, or when features change
+
+### Recommended Schedule
+
+```
+Weekly:
+  python scripts/predict.py
+  └─ Score open pipeline (inference only, cheap)
+
+Monthly:
+  python scripts/train_model.py --calibrate-only
+  └─ Refit calibrator (adjust for drift)
+  └─ If ratio >1.60, alert
+
+Yearly:
+  python scripts/train_model.py
+  └─ Full retrain (learn new patterns + preserve old)
+```
+
+### Calibration Thresholds
+
+Monitor `calibration_ratio` = `sum(predicted) / actual_wins`:
+
+| Ratio | Status | Action |
+|---|---|---|
+| <1.30 | ✓ OK | Continue |
+| 1.30–1.60 | ⚠ WARN | Run `--calibrate-only` next week |
+| >1.60 | 🚨 ALARM | Run `--calibrate-only` immediately |
+
+Minimum 15 wins in period to trust the ratio. Under 15: ignore.
+
+### Cost Comparison (Cloud Estimate)
+
+| Operation | Time | Cloud Cost | Frequency | Monthly Cost |
+|---|---|---|---|---|
+| Score open deals (inference) | <1 sec | $0.01 | Weekly | $0.05 |
+| `--calibrate-only` | <1 min | $2 | Monthly | $2 |
+| Full retrain | ~30 min | $50 | Yearly | $4 |
+| **Total** | — | — | — | ~$6/month |
+
+### Adding New Data
+
+**Process to incorporate new closed deals:**
+
+```bash
+# 1. Pull new closed deals from CRM
+python scripts/fetch_dim.py
+
+# 2. Engineer features (appends to train.parquet)
+python scripts/build_features.py
+
+# 3. Refit calibrator (learns new patterns)
+python scripts/train_model.py --calibrate-only
+
+# 4. Score open pipeline with updated calibrator
+python scripts/predict.py
+```
+
+New model sees:
+- All old closed deals (preserves learned patterns)
+- New closed deals this month (learns new patterns)
+- Recalibrates to match new reality
 
 ---
 
@@ -268,11 +398,43 @@ python train_model.py
 | **low** | 0.1–0.3 | Weak signal; minimal activity | Nurture |
 | **none** | <0.1 | No signal; too young to assess | Develop normally |
 
-### Expected Value vs Probability
+### Expected Value vs Weighted Forecast
 
-- `expected_value = win_probability × acv`
-- **Do not use** as a dollar forecast. Calibration unvalidated on open deals (different population).
-- **Use as a rank:** higher expected_value = better deal to focus on.
+**Two columns in CSV:**
+
+1. **`expected_value`** = `win_probability × acv` (naive sum, assumes perfect calibration)
+   - Optimistic. Can over-predict.
+   - Use for upside scenarios.
+
+2. **`weighted_forecast`** = `expected_value × signal_strength_weight` (accounts for uncertainty)
+   - Conservative. Better for budgeting.
+   - Use for base-case planning.
+
+**Signal Strength Weights** (discount factors for open deals):
+
+| Signal | Weight | Rationale |
+|---|---|---|
+| **high** | 1.0x | Model trained on closed deals. Strong signal matches training population. Trust fully. |
+| **medium** | 0.8x | Some activity but deals less mature. 20% discount for population mismatch. |
+| **low** | 0.5x | Very weak signal. Deals too young. Half confidence. |
+| **none** | 0.2x | Zero signal. Model abstaining. Only 20% confidence. Largest discount. |
+
+**Example:**
+- Deal with win_probability=0.7, acv=$1M, signal=high:
+  - `expected_value` = 0.7 × $1M = $0.70M
+  - `weighted_forecast` = 0.70M × 1.0 = $0.70M
+- Same deal, signal=low:
+  - `expected_value` = 0.7 × $1M = $0.70M
+  - `weighted_forecast` = 0.70M × 0.5 = $0.35M
+
+**Portfolio-level forecast:**
+- Unweighted sum: $7.21M (may over-predict)
+- Weighted sum: $2.29M (conservative, aligns with ARIMA baseline $2.19M/quarter)
+
+**When to adjust weights:**
+- After backtest validation, calibrate from actual outcomes
+- If model drifts (calibration ratio >1.60), reduce all weights 10%
+- If model under-predicts, increase high/medium weights
 
 ### Threshold 0.3
 
