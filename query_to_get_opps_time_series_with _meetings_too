@@ -1,0 +1,256 @@
+COPY (
+WITH opportunity_history AS (
+    SELECT
+        fo.*,
+        /* Stage information */
+        CAST(fo.stage_json AS JSON)->>'stage_id' AS stage_id,
+        CAST(fo.stage_json AS JSON)->>'name' AS stage_name,
+        /* Previous stage */
+        LAG(
+            CAST(fo.stage_json AS JSON)->>'stage_id'
+        ) OVER (
+            PARTITION BY fo.id
+            ORDER BY fo.object_version
+        ) AS previous_stage_id,
+        LAG(
+            CAST(fo.stage_json AS JSON)->>'name'
+        ) OVER (
+            PARTITION BY fo.id
+            ORDER BY fo.object_version
+        ) AS previous_stage_name
+    FROM read_parquet(
+        '/Users/ansh.patel/forecast_v0/devrev_fact_opportunity_*.parquet'
+    ) fo
+    WHERE fo.is_deleted = false
+      AND fo.stage_json IS NOT NULL
+      AND fo.stage_json <> ''
+),
+/*
+    Keep every actual stage transition.
+*/
+stage_transitions AS (
+    SELECT *
+    FROM opportunity_history
+    WHERE previous_stage_id IS NOT NULL
+      AND stage_id <> previous_stage_id
+),
+/*
+    Opportunities that have at least one stage transition.
+*/
+transition_opportunities AS (
+    SELECT DISTINCT
+        id AS opportunity_id
+    FROM stage_transitions
+),
+/*
+    Direct meeting -> opportunity relationship.
+    fact_link:
+        source_id = meeting
+        target_id = opportunity
+    Multiple meetings per opportunity are allowed.
+*/
+opportunity_meetings AS (
+    SELECT DISTINCT
+        l.target_id AS opportunity_id,
+        l.source_id AS meeting_id
+    FROM read_parquet(
+        '/Users/ansh.patel/forecast_v0/devrev_fact_link_*.parquet'
+    ) l
+    INNER JOIN transition_opportunities t
+        ON l.target_id = t.opportunity_id
+    WHERE l.is_deleted = false
+      AND l.source_object_type = 'meeting'
+      AND l.target_object_type = 'opportunity'
+),
+/*
+    Valid meetings.
+    transcript_id is available here as well, although it is
+    not included in the final ML feature set.
+*/
+meetings AS (
+    SELECT
+        id AS meeting_id,
+        ended_date,
+        transcript_id
+    FROM read_parquet(
+        '/Users/ansh.patel/forecast_v0/devrev_dim_meeting_0.parquet'
+    )
+    WHERE is_deleted = false
+      AND ended_date IS NOT NULL
+),
+/*
+    Calculate all features as-of each stage transition.
+    IMPORTANT:
+    Only meetings that have already ended by the transition
+    timestamp are counted.
+*/
+transition_features AS (
+    SELECT
+        s.id,
+        s.display_id,
+        s.object_version,
+        s.modified_date,
+        s.created_date,
+        s.previous_stage_name,
+        s.stage_name,
+        /*
+            Extract tnt__ fields directly from custom_fields.
+        */
+        CAST(s.custom_fields AS JSON)->>'tnt__opportunity_type'
+            AS opportunity_type,
+        CAST(s.custom_fields AS JSON)->>'tnt__segment'
+            AS segment,
+        TRY_CAST(
+            CAST(s.custom_fields AS JSON)->>'tnt__days_in_current_stage'
+            AS DOUBLE
+        ) AS days_in_current_stage,
+        TRY_CAST(
+            CAST(s.custom_fields AS JSON)->>'tnt__days_in_sales_cycle'
+            AS DOUBLE
+        ) AS days_in_sales_cycle,
+        CAST(s.custom_fields AS JSON)->>'tnt__champion'
+            AS champion,
+        TRY_CAST(
+            CAST(s.custom_fields AS JSON)->>'tnt__contract_months'
+            AS DOUBLE
+        ) AS contract_length,
+        TRY_CAST(
+            CAST(s.custom_fields AS JSON)->>'tnt__poc'
+            AS BOOLEAN
+        ) AS poc,
+        TRY_CAST(
+            CAST(s.custom_fields AS JSON)->>'tnt__technical_voc'
+            AS BOOLEAN
+        ) AS technical_voc,
+        /*
+            Count distinct meetings.
+            Multiple meetings for the same opportunity are
+            intentionally counted separately.
+        */
+        COUNT(DISTINCT m.meeting_id) AS meetings_conducted,
+        /*
+            Number of meetings that have transcripts.
+        */
+        COUNT(DISTINCT m.meeting_id)
+            FILTER (
+                WHERE m.transcript_id IS NOT NULL
+                  AND CAST(m.transcript_id AS VARCHAR) <> ''
+            ) AS meetings_with_transcript,
+        /*
+            Most recent meeting before this transition.
+        */
+        MAX(m.ended_date) AS latest_meeting_date
+    FROM stage_transitions s
+    LEFT JOIN opportunity_meetings om
+        ON s.id = om.opportunity_id
+    LEFT JOIN meetings m
+        ON om.meeting_id = m.meeting_id
+       AND m.ended_date <= s.created_date
+    GROUP BY
+        s.id,
+        s.display_id,
+        s.object_version,
+        s.modified_date,
+        s.created_date,
+        s.previous_stage_name,
+        s.stage_name,
+        s.custom_fields
+),
+/*
+    Construct final ML features.
+*/
+model_features AS (
+    SELECT
+        /* Opportunity identifier */
+        id AS opportunity_id,
+        display_id,
+        /* Snapshot/version */
+        object_version AS snapshot_version,
+        /*
+            Timestamp representing the opportunity version.
+        */
+        modified_date AS snapshot_date,
+        /*
+            Current stage = stage before transition.
+        */
+        previous_stage_name AS current_stage,
+        /*
+            Prediction target = stage after transition.
+        */
+        stage_name AS next_stage,
+        /* Opportunity fields */
+        opportunity_type,
+        segment,
+        /* Stage duration */
+        days_in_current_stage,
+        /* Total sales-cycle duration */
+        days_in_sales_cycle,
+        /*
+            Derived feature:
+                days in current stage
+                --------------------
+                days in sales cycle
+        */
+        CASE
+            WHEN days_in_sales_cycle IS NOT NULL
+             AND days_in_sales_cycle > 0
+            THEN
+                days_in_current_stage / days_in_sales_cycle
+            ELSE NULL
+        END AS stall_ratio,
+        /*
+            Champion exists.
+        */
+        CASE
+            WHEN champion IS NOT NULL
+             AND CAST(champion AS VARCHAR) <> ''
+            THEN 1
+            ELSE 0
+        END AS has_champion,
+        /* Contract duration */
+        contract_length,
+        /*
+            Advanced opportunity.
+            POC OR technical VOC.
+        */
+        CASE
+            WHEN COALESCE(poc, false) = true
+              OR COALESCE(technical_voc, false) = true
+            THEN 1
+            ELSE 0
+        END AS advanced,
+        /*
+            Number of completed meetings before
+            the stage transition.
+        */
+        meetings_conducted
+    FROM transition_features
+)
+/*
+    Final ML dataset.
+*/
+SELECT
+    opportunity_id,
+    display_id,
+    snapshot_version,
+    snapshot_date,
+    current_stage,
+    next_stage,
+    opportunity_type,
+    segment,
+    days_in_current_stage,
+    days_in_sales_cycle,
+    stall_ratio,
+    has_champion,
+    contract_length,
+    advanced,
+    meetings_conducted
+FROM model_features
+ORDER BY
+    opportunity_id,
+    snapshot_version
+) TO '/Users/ansh.patel/forecast_v0/stage_transitions_model_final.csv'
+WITH (
+    HEADER ,
+    DELIMITER ','
+);
